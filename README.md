@@ -36,4 +36,8 @@ Notes:
 
 ## License
 
-Add a LICENSE file before publishing publicly.
+MIT. See LICENSE.
+
+## Releasing
+
+See RELEASING.md.
