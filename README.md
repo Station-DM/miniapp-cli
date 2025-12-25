@@ -23,6 +23,11 @@ swift build -c release
 ./.build/release/miniapp --help
 ```
 
+Release/version note:
+- `miniapp --version` prints the embedded constant in `Sources/Version.swift`.
+- When publishing a new Homebrew release, bump `miniAppCLIVersion` to match the tag (e.g. `v0.1.1`) before tagging.
+- If you use `sync_cli_to_public.sh`, you can also set `MINIAPP_CLI_VERSION` when syncing to stamp the public repo before committing.
+
 ## Usage
 
 ```sh
@@ -33,6 +38,7 @@ Notes:
 - If `--project` is not provided, the command searches the current directory tree for a `.xcodeproj`.
 - If multiple app targets exist, pass `--target`.
 - `--force` re-injects the build phase if already present.
+- Run `miniapp --version` to print the CLI semantic version (kept in sync with `miniAppCLIVersion` in `main.swift`).
 
 ## License
 

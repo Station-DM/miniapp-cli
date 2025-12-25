@@ -32,13 +32,18 @@ func printUsage() {
     miniapp
 
     Usage:
-      miniapp host sdk install [--project <path/to/App.xcodeproj>] [--target <TargetName>] [--force]
+            miniapp host sdk install [--project <path/to/App.xcodeproj>] [--target <TargetName>] [--force]
+            miniapp --version
 
     Notes:
       - This command injects a Run Script build phase into an iOS app target to generate miniapp-deps.json at build time.
       - The CLI is designed to be installed via Homebrew and available on PATH.
     """
     print(text)
+}
+
+func printVersion() {
+        print("miniapp version \(miniAppCLIVersion)")
 }
 
 struct InstallOptions {
@@ -282,21 +287,80 @@ func loadPBXProjJSON(pbxprojPath: String) throws -> [String: Any] {
     return dict
 }
 
-func writePBXProjJSON(_ json: [String: Any], to pbxprojPath: String) throws {
-    let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-    let tmpJSON = tmpDir.appendingPathComponent("miniapp-pbxproj.json")
-
-    let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-    try data.write(to: tmpJSON)
-
-    // Modern macOS `plutil` no longer supports writing OpenStep format.
-    // `project.pbxproj` is a plist, so writing as XML is accepted by Xcode.
-    _ = try runProcess("/usr/bin/plutil", ["-convert", "xml1", "-o", pbxprojPath, tmpJSON.path])
-}
-
 func generateObjectID() -> String {
     let bytes = (0..<12).map { _ in UInt8.random(in: 0...255) }
     return bytes.map { String(format: "%02X", $0) }.joined()
+}
+
+func removeExistingPhaseEntries(from content: String) -> String {
+    var updated = content
+
+    while let markerRange = updated.range(of: "/* [SDM] Generate Dependencies */ = {") {
+        let blockStart = updated.lineRange(for: markerRange).lowerBound
+        guard let blockEndRange = updated.range(of: "};", range: markerRange.upperBound..<updated.endIndex) else {
+            break
+        }
+        let blockEnd = updated.index(after: blockEndRange.upperBound)
+        updated.removeSubrange(blockStart..<blockEnd)
+    }
+
+    while let markerRange = updated.range(of: "/* [SDM] Generate Dependencies */") {
+        let lineRange = updated.lineRange(for: markerRange)
+        let line = updated[lineRange]
+        if line.contains("= {") {
+            updated.removeSubrange(lineRange)
+            continue
+        }
+        updated.removeSubrange(lineRange)
+    }
+
+    return updated
+}
+
+func insertShellScriptPhaseBlock(_ content: String, phaseID: String, scriptPathRelativeToSRCROOT: String) throws -> String {
+    let endMarker = "/* End PBXShellScriptBuildPhase section */"
+    guard let insertRange = content.range(of: endMarker) else {
+        throw MiniAppCLIError.commandFailed("PBXShellScriptBuildPhase section missing")
+    }
+
+    let block = """
+                \(phaseID) /* [SDM] Generate Dependencies */ = {
+                        isa = PBXShellScriptBuildPhase;
+                        buildActionMask = 2147483647;
+                        files = (
+                        );
+                        inputPaths = (
+                        );
+                        name = "[SDM] Generate Dependencies";
+                        outputPaths = (
+                        );
+                        runOnlyForDeploymentPostprocessing = 0;
+                        shellPath = /bin/sh;
+                        shellScript = "\"$SRCROOT/\(scriptPathRelativeToSRCROOT)\"\n";
+                        showEnvVarsInLog = 0;
+                };
+"""
+
+    var updated = content
+    updated.insert(contentsOf: "\n" + block, at: insertRange.lowerBound)
+    return updated
+}
+
+func insertPhaseReference(_ content: String, phaseID: String, targetID: String) throws -> String {
+    guard let targetRange = content.range(of: "\(targetID) /*") else {
+        throw MiniAppCLIError.commandFailed("Target block not found in pbxproj")
+    }
+    guard let buildPhasesRange = content.range(of: "buildPhases = (", range: targetRange.lowerBound..<content.endIndex) else {
+        throw MiniAppCLIError.commandFailed("buildPhases list missing for target")
+    }
+    guard let closingRange = content.range(of: ");", range: buildPhasesRange.upperBound..<content.endIndex) else {
+        throw MiniAppCLIError.commandFailed("buildPhases list malformed")
+    }
+
+    var updated = content
+    let entry = "                                \(phaseID) /* [SDM] Generate Dependencies */,\n"
+    updated.insert(contentsOf: entry, at: closingRange.lowerBound)
+    return updated
 }
 
 func findAppTargets(objects: [String: Any]) -> [(id: String, obj: [String: Any])] {
@@ -325,21 +389,9 @@ func injectRunScriptBuildPhase(
     scriptPathRelativeToSRCROOT: String,
     force: Bool
 ) throws {
-    var root = try loadPBXProjJSON(pbxprojPath: pbxprojPath)
-    guard var objects = root["objects"] as? [String: Any] else {
+    let root = try loadPBXProjJSON(pbxprojPath: pbxprojPath)
+    guard let objects = root["objects"] as? [String: Any] else {
         throw MiniAppCLIError.commandFailed("pbxproj missing objects")
-    }
-
-    // Idempotency: if already contains the phase name, skip unless force.
-    let markerName = "[SDM] Generate Dependencies"
-    if !force {
-        for (_, value) in objects {
-            guard let dict = value as? [String: Any] else { continue }
-            if dict["isa"] as? String == "PBXShellScriptBuildPhase", dict["name"] as? String == markerName {
-                Logger.info("Run Script build phase already present; skipping")
-                return
-            }
-        }
     }
 
     let appTargets = findAppTargets(objects: objects)
@@ -366,34 +418,21 @@ func injectRunScriptBuildPhase(
         }
     }
 
-    var targetObj = selected.obj
-    guard var buildPhases = targetObj["buildPhases"] as? [Any] else {
-        throw MiniAppCLIError.commandFailed("Target buildPhases missing")
+    var content = try String(contentsOfFile: pbxprojPath, encoding: .utf8)
+    let markerName = "[SDM] Generate Dependencies"
+    if content.contains(markerName) {
+        if !force {
+            Logger.info("Run Script build phase already present; skipping")
+            return
+        }
+        content = removeExistingPhaseEntries(from: content)
     }
 
     let phaseID = generateObjectID()
-    let shellScript = "\"$SRCROOT/\(scriptPathRelativeToSRCROOT)\"\n"
+    content = try insertShellScriptPhaseBlock(content, phaseID: phaseID, scriptPathRelativeToSRCROOT: scriptPathRelativeToSRCROOT)
+    content = try insertPhaseReference(content, phaseID: phaseID, targetID: selected.id)
 
-    let phaseObj: [String: Any] = [
-        "isa": "PBXShellScriptBuildPhase",
-        "buildActionMask": 2147483647,
-        "files": [],
-        "inputPaths": [],
-        "outputPaths": [],
-        "name": markerName,
-        "runOnlyForDeploymentPostprocessing": 0,
-        "shellPath": "/bin/sh",
-        "shellScript": shellScript,
-        "showEnvVarsInLog": 0
-    ]
-
-    objects[phaseID] = phaseObj
-    buildPhases.append(phaseID)
-    targetObj["buildPhases"] = buildPhases
-    objects[selected.id] = targetObj
-    root["objects"] = objects
-
-    try writePBXProjJSON(root, to: pbxprojPath)
+    try content.write(to: URL(fileURLWithPath: pbxprojPath), atomically: true, encoding: .utf8)
     Logger.info("Injected Run Script build phase into target: \(targetDisplayName(selected.obj))")
 }
 
@@ -460,6 +499,11 @@ func main() throws {
 
     if args.contains("-h") || args.contains("--help") {
         printUsage()
+        return
+    }
+
+    if args.count == 2 && args[1] == "--version" {
+        printVersion()
         return
     }
 
