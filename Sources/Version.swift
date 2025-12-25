@@ -7,4 +7,4 @@ import Foundation
 /// Note: Homebrew often builds from a source tarball without git metadata, so the
 /// version must be embedded in the source at release time (similar to how `pod --version`
 /// prints the CocoaPods gem version constant).
-let miniAppCLIVersion = "v0.1.3"
+let miniAppCLIVersion = "v0.1.4"

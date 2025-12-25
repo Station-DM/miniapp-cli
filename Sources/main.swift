@@ -317,33 +317,92 @@ func removeExistingPhaseEntries(from content: String) -> String {
     return updated
 }
 
-func insertShellScriptPhaseBlock(_ content: String, phaseID: String, scriptPathRelativeToSRCROOT: String) throws -> String {
-    let endMarker = "/* End PBXShellScriptBuildPhase section */"
-    guard let insertRange = content.range(of: endMarker) else {
-        throw MiniAppCLIError.commandFailed("PBXShellScriptBuildPhase section missing")
+func findInsertionIndexForNewBuildPhaseSection(in content: String) -> String.Index? {
+    // Prefer inserting after the last existing BuildPhase section.
+    var searchEnd = content.endIndex
+    while let markerRange = content.range(of: "/* End PBX", options: .backwards, range: content.startIndex..<searchEnd) {
+        let lineRange = content.lineRange(for: markerRange)
+        if content[lineRange].contains("BuildPhase section */") {
+            return lineRange.upperBound
+        }
+        searchEnd = markerRange.lowerBound
     }
 
-    let block = """
-                \(phaseID) /* [SDM] Generate Dependencies */ = {
-                        isa = PBXShellScriptBuildPhase;
-                        buildActionMask = 2147483647;
-                        files = (
-                        );
-                        inputPaths = (
-                        );
-                        name = "[SDM] Generate Dependencies";
-                        outputPaths = (
-                        );
-                        runOnlyForDeploymentPostprocessing = 0;
-                        shellPath = /bin/sh;
-                        shellScript = "\"$SRCROOT/\(scriptPathRelativeToSRCROOT)\"\n";
-                        showEnvVarsInLog = 0;
-                };
-"""
+    // Fallback: insert before targets if build phase sections are not found.
+    if let nativeTargetBegin = content.range(of: "/* Begin PBXNativeTarget section */") {
+        return nativeTargetBegin.lowerBound
+    }
+    if let projectBegin = content.range(of: "/* Begin PBXProject section */") {
+        return projectBegin.lowerBound
+    }
+    return nil
+}
+
+func normalizePBXShellScriptBuildPhaseSectionWhitespace(_ content: String) -> String {
+    let beginMarker = "/* Begin PBXShellScriptBuildPhase section */"
+    let endMarker = "/* End PBXShellScriptBuildPhase section */"
 
     var updated = content
-    updated.insert(contentsOf: "\n" + block, at: insertRange.lowerBound)
+
+    // Collapse multiple blank lines immediately after the begin marker.
+    while updated.contains("\(beginMarker)\n\n") {
+        updated = updated.replacingOccurrences(of: "\(beginMarker)\n\n", with: "\(beginMarker)\n")
+    }
+
+    // Collapse multiple blank lines immediately before the end marker.
+    while updated.contains("\n\n\(endMarker)") {
+        updated = updated.replacingOccurrences(of: "\n\n\(endMarker)", with: "\n\(endMarker)")
+    }
+
     return updated
+}
+
+func insertShellScriptPhaseBlock(_ content: String, phaseID: String, scriptPathRelativeToSRCROOT: String) throws -> String {
+    let beginMarker = "/* Begin PBXShellScriptBuildPhase section */"
+    let endMarker = "/* End PBXShellScriptBuildPhase section */"
+
+    // IMPORTANT:
+    // - `shellScript` must contain a literal "\n" escape in the pbxproj (not an actual newline).
+    // - Quotes inside the pbxproj string must be written as `\"`.
+    let block = """
+            \(phaseID) /* [SDM] Generate Dependencies */ = {
+                isa = PBXShellScriptBuildPhase;
+                buildActionMask = 2147483647;
+                files = (
+                );
+                inputPaths = (
+                );
+                name = "[SDM] Generate Dependencies";
+                outputPaths = (
+                );
+                runOnlyForDeploymentPostprocessing = 0;
+                shellPath = /bin/sh;
+                shellScript = "\\\"$SRCROOT/\(scriptPathRelativeToSRCROOT)\\\"\\n";
+                showEnvVarsInLog = 0;
+            };
+    """
+
+    // Normalize to avoid introducing extra blank lines around the insertion point.
+    // The Swift multiline literal typically includes a leading newline; trim and add exactly one trailing newline.
+    let normalizedBlock = block.trimmingCharacters(in: .newlines) + "\n"
+
+    var updated = content
+
+    if let insertRange = updated.range(of: endMarker) {
+        // Insert at the start of the end-marker line; `normalizedBlock` already ends with a newline.
+        updated.insert(contentsOf: normalizedBlock, at: insertRange.lowerBound)
+        return normalizePBXShellScriptBuildPhaseSectionWhitespace(updated)
+    }
+
+    // If the section does not exist (common when the project has never had a Run Script phase), create it.
+    guard let sectionInsertIndex = findInsertionIndexForNewBuildPhaseSection(in: updated) else {
+        throw MiniAppCLIError.commandFailed("Unable to insert PBXShellScriptBuildPhase section")
+    }
+
+    // `normalizedBlock` already ends with a newline, so the end marker will land on its own line.
+    let section = "\n\(beginMarker)\n\(normalizedBlock)\(endMarker)\n"
+    updated.insert(contentsOf: section, at: sectionInsertIndex)
+    return normalizePBXShellScriptBuildPhaseSectionWhitespace(updated)
 }
 
 func insertPhaseReference(_ content: String, phaseID: String, targetID: String) throws -> String {
@@ -358,8 +417,27 @@ func insertPhaseReference(_ content: String, phaseID: String, targetID: String) 
     }
 
     var updated = content
-    let entry = "                                \(phaseID) /* [SDM] Generate Dependencies */,\n"
-    updated.insert(contentsOf: entry, at: closingRange.lowerBound)
+
+    // Insert *before the closing line*, not before the `);` token.
+    // Otherwise the indentation that precedes `);` stays on the previous line
+    // and the closing line becomes unindented / messy.
+    let closingLineRange = content.lineRange(for: closingRange)
+
+    // Match indentation used by the existing `buildPhases` list.
+    // Conventionally entries are indented one level deeper than the `buildPhases = (` line.
+    let buildPhasesLineRange = content.lineRange(for: buildPhasesRange)
+    let buildPhasesLine = content[buildPhasesLineRange]
+    let baseIndent = String(buildPhasesLine.prefix { $0 == "\t" || $0 == " " })
+    let entryIndent = baseIndent + "\t"
+
+    // If a previous run inserted at the `);` token, the closing line may have lost indentation
+    // and now starts at column 0. Detect and repair that by prefixing `baseIndent`.
+    let closingLine = String(content[closingLineRange])
+    let needsClosingIndentFix = closingLine.hasPrefix(");")
+    let closingIndentPrefix = needsClosingIndentFix ? baseIndent : ""
+
+        let entry = "\(entryIndent)\(phaseID) /* [SDM] Generate Dependencies */,\n\(closingIndentPrefix)"
+    updated.insert(contentsOf: entry, at: closingLineRange.lowerBound)
     return updated
 }
 
