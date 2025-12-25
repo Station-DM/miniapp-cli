@@ -120,18 +120,22 @@ func runProcessDiscardingStdout(_ launchPath: String, _ arguments: [String]) thr
     }
 }
 
-func findXcodeproj(in directory: URL) -> URL? {
-    guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-        return nil
+func findXcodeprojs(in directory: URL) -> [URL] {
+    guard let enumerator = FileManager.default.enumerator(
+        at: directory,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return []
     }
 
+    var result: [URL] = []
     for case let url as URL in enumerator {
         if url.pathExtension == "xcodeproj" {
-            return url
+            result.append(url)
         }
     }
-
-    return nil
+    return result
 }
 
 let generatorScriptName = "sdm-gen-deps.sh"
@@ -317,6 +321,7 @@ func targetDisplayName(_ target: [String: Any]) -> String {
 func injectRunScriptBuildPhase(
     pbxprojPath: String,
     targetName: String?,
+    preferredTargetName: String?,
     scriptPathRelativeToSRCROOT: String,
     force: Bool
 ) throws {
@@ -347,11 +352,18 @@ func injectRunScriptBuildPhase(
         }
         selected = match
     } else {
-        guard appTargets.count == 1 else {
+        if appTargets.count == 1 {
+            selected = appTargets[0]
+        } else if let preferredTargetName,
+                  let match = appTargets.first(where: { targetDisplayName($0.obj) == preferredTargetName }) {
+            selected = match
+        } else {
             let available = appTargets.map { targetDisplayName($0.obj) }.joined(separator: ", ")
+            if let preferredTargetName {
+                throw MiniAppCLIError.invalidArguments("Multiple app targets found; couldn't auto-select target named '\(preferredTargetName)'. Pass --target. Available: [\(available)]")
+            }
             throw MiniAppCLIError.invalidArguments("Multiple app targets found; pass --target. Available: [\(available)]")
         }
-        selected = appTargets[0]
     }
 
     var targetObj = selected.obj
@@ -391,10 +403,24 @@ func handleInstall(_ options: InstallOptions) throws {
     let xcodeprojURL: URL
     if let projectPath = options.projectPath {
         xcodeprojURL = URL(fileURLWithPath: projectPath)
-    } else if let found = findXcodeproj(in: cwd) {
-        xcodeprojURL = found
     } else {
-        throw MiniAppCLIError.fileNotFound("No .xcodeproj found. Pass --project <path/to/App.xcodeproj>.")
+        let found = findXcodeprojs(in: cwd)
+        let filtered = found.filter { $0.lastPathComponent.lowercased() != "pods.xcodeproj" }
+        let candidates = filtered.isEmpty ? found : filtered
+
+        if candidates.isEmpty {
+            throw MiniAppCLIError.fileNotFound("No .xcodeproj found. Pass --project <path/to/App.xcodeproj>.")
+        }
+
+        if candidates.count == 1 {
+            xcodeprojURL = candidates[0]
+        } else {
+            let listed = candidates
+                .map { $0.path }
+                .sorted()
+                .joined(separator: ", ")
+            throw MiniAppCLIError.invalidArguments("Multiple .xcodeproj found; pass --project. Candidates: [\(listed)]")
+        }
     }
 
     guard xcodeprojURL.pathExtension == "xcodeproj" else {
@@ -411,9 +437,12 @@ func handleInstall(_ options: InstallOptions) throws {
     let scriptURL = try installGeneratorScript(into: projectDir, force: options.force)
     let relScriptPath = "Scripts/\(scriptURL.lastPathComponent)"
 
+    let inferredTargetName = xcodeprojURL.deletingPathExtension().lastPathComponent
+
     try injectRunScriptBuildPhase(
         pbxprojPath: pbxprojURL.path,
         targetName: options.targetName,
+        preferredTargetName: inferredTargetName,
         scriptPathRelativeToSRCROOT: relScriptPath,
         force: options.force
     )
