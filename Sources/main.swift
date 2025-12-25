@@ -96,6 +96,30 @@ func runProcess(_ launchPath: String, _ arguments: [String]) throws -> Data {
     return outData
 }
 
+func runProcessDiscardingStdout(_ launchPath: String, _ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: launchPath)
+    process.arguments = arguments
+
+    // Some tools (e.g. plutil converting a large project.pbxproj to JSON)
+    // can produce enough stdout to fill a pipe buffer and deadlock if the parent
+    // only reads after the child exits. Prefer writing to a file or discarding stdout.
+    process.standardOutput = FileHandle.nullDevice
+
+    let stderr = Pipe()
+    process.standardError = stderr
+
+    try process.run()
+    process.waitUntilExit()
+
+    let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+
+    guard process.terminationStatus == 0 else {
+        let errText = String(data: errData, encoding: .utf8) ?? ""
+        throw MiniAppCLIError.commandFailed("\(launchPath) \(arguments.joined(separator: " ")) failed: \(errText)")
+    }
+}
+
 func findXcodeproj(in directory: URL) -> URL? {
     guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
         return nil
@@ -240,7 +264,13 @@ func installGeneratorScript(into projectDir: URL, force: Bool) throws -> URL {
 }
 
 func loadPBXProjJSON(pbxprojPath: String) throws -> [String: Any] {
-    let jsonData = try runProcess("/usr/bin/plutil", ["-convert", "json", "-o", "-", pbxprojPath])
+    let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    let tmpJSON = tmpDir.appendingPathComponent("miniapp-pbxproj-\(UUID().uuidString).json")
+
+    // Avoid `-o -` (stdout) to prevent potential pipe-buffer deadlocks.
+    try runProcessDiscardingStdout("/usr/bin/plutil", ["-convert", "json", "-o", tmpJSON.path, pbxprojPath])
+
+    let jsonData = try Data(contentsOf: tmpJSON)
     let obj = try JSONSerialization.jsonObject(with: jsonData)
     guard let dict = obj as? [String: Any] else {
         throw MiniAppCLIError.commandFailed("pbxproj json is not a dictionary")
@@ -255,7 +285,9 @@ func writePBXProjJSON(_ json: [String: Any], to pbxprojPath: String) throws {
     let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: tmpJSON)
 
-    _ = try runProcess("/usr/bin/plutil", ["-convert", "openstep", "-o", pbxprojPath, tmpJSON.path])
+    // Modern macOS `plutil` no longer supports writing OpenStep format.
+    // `project.pbxproj` is a plist, so writing as XML is accepted by Xcode.
+    _ = try runProcess("/usr/bin/plutil", ["-convert", "xml1", "-o", pbxprojPath, tmpJSON.path])
 }
 
 func generateObjectID() -> String {
