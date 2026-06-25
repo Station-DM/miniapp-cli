@@ -6,7 +6,7 @@ VERSION=$1
 # 如果没有传参，尝试从 Version.swift 里自动读取
 if [ -z "$VERSION" ]; then
     if [ -f "Sources/Version.swift" ]; then
-        VERSION=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' Sources/Version.swift | head -1)
+        VERSION=$(grep 'let miniAppCLIVersion' Sources/Version.swift | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     fi
     if [ -z "$VERSION" ]; then
         echo "Usage: $0 <version> (e.g. v0.1.5)"
