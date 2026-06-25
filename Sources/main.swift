@@ -147,111 +147,159 @@ let generatorScriptName = "sdm-gen-deps.sh"
 
 func generatorScriptContents() -> String {
     // Keep this script self-contained. It should never fail the build.
-    return """
+    return #"""
 #!/bin/sh
 set -e
 
-OUTPUT_PATH=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/miniapp-deps.json\"
+OUTPUT_PATH="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/miniapp-deps.json"
+SEARCH_ROOT="${SRCROOT:-.}"
 
-# Resolve pbxproj path
-PBXPROJ=\"\"
-if [ -n \"$PROJECT_FILE_PATH\" ] && [ -f \"$PROJECT_FILE_PATH/project.pbxproj\" ]; then
-  PBXPROJ=\"$PROJECT_FILE_PATH/project.pbxproj\"
-elif [ -n \"$SRCROOT\" ]; then
-  PBXPROJ=\"$(find \"$SRCROOT\" -maxdepth 4 -name project.pbxproj -path '*/.xcodeproj/*' -print -quit 2>/dev/null)\"
+# ── 1. Resolve pbxproj path ──────────────────────────────────────────────────
+PBXPROJ=""
+if [ -n "$PROJECT_FILE_PATH" ] && [ -f "$PROJECT_FILE_PATH/project.pbxproj" ]; then
+  PBXPROJ="$PROJECT_FILE_PATH/project.pbxproj"
+elif [ -n "$SRCROOT" ]; then
+  PBXPROJ="$(find "$SRCROOT" -maxdepth 4 -name project.pbxproj -path '*/.xcodeproj/*' -print -quit 2>/dev/null)"
 fi
 
-if [ -z \"$PBXPROJ\" ] || [ ! -f \"$PBXPROJ\" ]; then
-  echo \"[SDM] WARN: project.pbxproj not found; writing empty miniapp-deps.json\" >&2
-  mkdir -p \"$(dirname \"$OUTPUT_PATH\")\"
-  echo '[]' > \"$OUTPUT_PATH\"
+PBXPROJ_JSON=""
+if [ -n "$PBXPROJ" ] && [ -f "$PBXPROJ" ]; then
+  PBXPROJ_JSON="$(/usr/bin/plutil -convert json -o - "$PBXPROJ" 2>/dev/null || true)"
+fi
+
+# ── 2. Collect local Package.swift files (skip build artifacts) ──────────────
+PKG_SWIFT_PATHS=""
+while IFS= read -r pf; do
+  [ -n "$pf" ] && PKG_SWIFT_PATHS="${PKG_SWIFT_PATHS:+$PKG_SWIFT_PATHS|}$pf"
+done <<EOF
+$(find "$SEARCH_ROOT" -maxdepth 4 -name Package.swift \
+  -not -path '*/.build/*' \
+  -not -path '*/DerivedData/*' \
+  -not -path '*/Pods/*' \
+  -not -path '*/Carthage/*' \
+  2>/dev/null || true)
+EOF
+
+# ── 3. Generate miniapp-deps.json ────────────────────────────────────────────
+if [ -z "$PBXPROJ_JSON" ] && [ -z "$PKG_SWIFT_PATHS" ]; then
+  echo "[SDM] WARN: no dependency sources found; writing empty miniapp-deps.json" >&2
+  mkdir -p "$(dirname "$OUTPUT_PATH")"
+  echo '[]' > "$OUTPUT_PATH"
   exit 0
 fi
 
-JSON=\"$(/usr/bin/plutil -convert json -o - \"$PBXPROJ\" 2>/dev/null || true)\"
-if [ -z \"$JSON\" ]; then
-  echo \"[SDM] WARN: failed to convert pbxproj to json; writing empty miniapp-deps.json\" >&2
-  mkdir -p \"$(dirname \"$OUTPUT_PATH\")\"
-  echo '[]' > \"$OUTPUT_PATH\"
-  exit 0
-fi
+python3 - <<'PY' "$OUTPUT_PATH" "$PBXPROJ_JSON" "$PKG_SWIFT_PATHS" || true
+import json, sys, re, os
 
-python3 - <<'PY' "$OUTPUT_PATH" "$JSON" || true
-import json
-import sys
-import re
+output_path   = sys.argv[1]
+pbx_json_str  = sys.argv[2] if len(sys.argv) > 2 else ''
+pkg_swift_str = sys.argv[3] if len(sys.argv) > 3 else ''
 
-output_path = sys.argv[1]
-pbx_json = sys.argv[2]
+records_by_url = {}   # url -> {name, url, type, version}
 
-try:
-    data = json.loads(pbx_json)
-except Exception:
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('[]')
-    sys.exit(0)
+def derive_name(url):
+    m = re.search(r"/([^/]+?)(?:\.git)?$", url)
+    return m.group(1) if m else url
 
-objects = data.get('objects', {}) or {}
+# ── Source 1 (highest priority): pbxproj direct XCRemoteSwiftPackageReference ──
+if pbx_json_str:
+    try:
+        data    = json.loads(pbx_json_str)
+        objects = data.get('objects') or {}
 
-# Map packageRefId -> {url, type, version}
-packages = {}
-for oid, obj in objects.items():
-    if not isinstance(obj, dict):
+        pkg_refs = {}
+        for oid, obj in objects.items():
+            if not isinstance(obj, dict):
+                continue
+            if obj.get('isa') != 'XCRemoteSwiftPackageReference':
+                continue
+            url = obj.get('repositoryURL') or ''
+            req  = obj.get('requirement') or {}
+            kind = req.get('kind') or ''
+            version = ''
+            if kind in ('upToNextMajorVersion', 'upToNextMinorVersion'):
+                version = req.get('minimumVersion') or ''
+            elif kind == 'exactVersion':
+                version = req.get('version') or ''
+            elif kind == 'revision':
+                version = req.get('revision') or ''
+            elif kind == 'branch':
+                version = req.get('branch') or ''
+            elif kind == 'versionRange':
+                lo = req.get('minimumVersion') or ''
+                hi = req.get('maximumVersion') or ''
+                version = f"{lo}..{hi}" if (lo or hi) else ''
+            pkg_refs[oid] = {'url': url, 'type': kind, 'version': version}
+
+        for oid, obj in objects.items():
+            if not isinstance(obj, dict):
+                continue
+            if obj.get('isa') != 'XCSwiftPackageProductDependency':
+                continue
+            ref = obj.get('package')
+            if not ref or ref not in pkg_refs:
+                continue
+            pkg = pkg_refs[ref]
+            url = pkg['url']
+            if not url or url in records_by_url:
+                continue
+            name = obj.get('productName') or derive_name(url)
+            records_by_url[url] = {
+                'name': name, 'url': url,
+                'type': pkg['type'], 'version': pkg['version']
+            }
+    except Exception:
+        pass
+
+# ── Source 2: local Package.swift files (.package(url:...) declarations) ──────
+for pf in pkg_swift_str.split('|'):
+    pf = pf.strip()
+    if not pf or not os.path.isfile(pf):
         continue
-    if obj.get('isa') == 'XCRemoteSwiftPackageReference':
-        url = obj.get('repositoryURL') or ''
-        req = obj.get('requirement') or {}
-        kind = req.get('kind') or ''
-        version = ''
-        if kind in ('upToNextMajorVersion', 'upToNextMinorVersion'):
-            version = req.get('minimumVersion') or ''
-        elif kind in ('exactVersion'):
-            version = req.get('version') or ''
-        elif kind in ('revision'):
-            version = req.get('revision') or ''
-        elif kind in ('branch'):
-            version = req.get('branch') or ''
-        elif kind in ('versionRange'):
-            min_v = req.get('minimumVersion') or ''
-            max_v = req.get('maximumVersion') or ''
-            version = f"{min_v}..{max_v}" if (min_v or max_v) else ''
-        packages[oid] = { 'url': url, 'type': kind, 'version': version }
-
-# Gather product dependencies and associate to package
-records = []
-seen = set()
-for oid, obj in objects.items():
-    if not isinstance(obj, dict):
+    try:
+        content = open(pf, encoding='utf-8').read()
+    except Exception:
         continue
-    if obj.get('isa') == 'XCSwiftPackageProductDependency':
-        pkg_ref = obj.get('package')
-        if not pkg_ref or pkg_ref not in packages:
+
+    pattern = re.compile(
+        r'\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*'
+        r'(?:'
+        r'from\s*:\s*"([^"]*)"'                                   # g2 from
+        r'|exact\s*:\s*"([^"]*)"'                                  # g3 exact
+        r'|branch\s*:\s*"([^"]*)"'                                 # g4 branch
+        r'|revision\s*:\s*"([^"]*)"'                               # g5 revision
+        r'|\.upToNextMajor\s*\(\s*from\s*:\s*"([^"]*)"\s*\)'       # g6
+        r'|\.upToNextMinor\s*\(\s*from\s*:\s*"([^"]*)"\s*\)'       # g7
+        r'|"([^"]*)"'                                              # g8 range start
+        r')'
+    )
+    for m in pattern.finditer(content):
+        url = m.group(1)
+        if not url or url in records_by_url:
             continue
-        pkg = packages[pkg_ref]
-        url = pkg.get('url') or ''
-        dep_type = pkg.get('type') or ''
-        version = pkg.get('version') or ''
+        version, dep_type = '', ''
+        if   m.group(2): version, dep_type = m.group(2), 'upToNextMajorVersion'
+        elif m.group(3): version, dep_type = m.group(3), 'exactVersion'
+        elif m.group(4): version, dep_type = m.group(4), 'branch'
+        elif m.group(5): version, dep_type = m.group(5), 'revision'
+        elif m.group(6): version, dep_type = m.group(6), 'upToNextMajorVersion'
+        elif m.group(7): version, dep_type = m.group(7), 'upToNextMinorVersion'
+        elif m.group(8): version, dep_type = m.group(8), 'versionRange'
+        records_by_url[url] = {
+            'name': derive_name(url), 'url': url,
+            'type': dep_type, 'version': version
+        }
 
-        name = obj.get('productName') or ''
-        if not name and url:
-            # Derive a stable package-ish name from URL
-            m = re.search(r"/([^/]+?)(?:\\.git)?$", url)
-            name = m.group(1) if m else url
+# ── Output ───────────────────────────────────────────────────────────────────
+records = sorted(records_by_url.values(),
+                 key=lambda r: (r.get('name','').lower(), r.get('url','')))
 
-        key = (url, dep_type, version)
-        if key in seen:
-            continue
-        seen.add(key)
-        records.append({ 'name': name, 'url': url, 'type': dep_type, 'version': version })
-
-records.sort(key=lambda r: (r.get('name') or '', r.get('url') or ''))
-
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
 with open(output_path, 'w', encoding='utf-8') as f:
     json.dump(records, f, ensure_ascii=False)
 PY
 
-exit 0
-"""
+exit 0"""#
 }
 
 func installGeneratorScript(into projectDir: URL, force: Bool) throws -> URL {
