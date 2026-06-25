@@ -299,7 +299,8 @@ with open(output_path, 'w', encoding='utf-8') as f:
     json.dump(records, f, ensure_ascii=False)
 PY
 
-exit 0"""#
+exit 0
+"""#
 }
 
 func installGeneratorScript(into projectDir: URL, force: Bool) throws -> URL {

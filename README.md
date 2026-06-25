@@ -23,10 +23,20 @@ swift build -c release
 ./.build/release/miniapp --help
 ```
 
-Release/version note:
-- `miniapp --version` prints the embedded constant in `Sources/Version.swift`.
-- When publishing a new Homebrew release, bump `miniAppCLIVersion` to match the tag (e.g. `v0.1.1`) before tagging.
-- If you use `sync_cli_to_public.sh`, you can also set `MINIAPP_CLI_VERSION` when syncing to stamp the public repo before committing.
+## Release & Upgrade Guide
+
+To release a new version of the CLI and update it in Homebrew:
+
+1. **Bump Version**: Update the `miniAppCLIVersion` constant in `Sources/Version.swift` (e.g. to `v0.1.5`).
+2. **Tag and Push**: Commit the change, tag it (`git tag v0.1.5`), and push the tag to this remote repository (`git push origin main --tags`).
+3. **Update Homebrew Tap**:
+   - Go to the `Station-DM/homebrew-miniapp` tap repository.
+   - Edit `Formula/miniapp.rb`.
+   - Update the `url` to the new tag's tarball (e.g., `https://github.com/Station-DM/miniapp-cli/archive/refs/tags/v0.1.5.tar.gz`).
+   - Run `curl -sL <the-url-above> | shasum -a 256` to calculate the new hash.
+   - Update the `sha256` field with the new hash.
+   - Commit and push the updated formula.
+   - Users can now run `brew upgrade miniapp` to get the latest version.
 
 ## Usage
 
