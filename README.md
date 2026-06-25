@@ -9,7 +9,17 @@ That script generates `miniapp-deps.json` into your app bundle resources at buil
 
 ## Install (recommended)
 
-This CLI is intended to be installed via Homebrew (tap + formula).
+```sh
+brew tap station-dm/miniapp
+brew trust station-dm/miniapp
+brew install miniapp
+```
+
+Upgrade to the latest version:
+
+```sh
+brew update && brew upgrade miniapp
+```
 
 ## Build from source
 
@@ -29,13 +39,15 @@ To release a new version of the CLI and update it in Homebrew:
 
 1. **Bump Version**: Update the `miniAppCLIVersion` constant in `Sources/Version.swift` (e.g. to `v0.1.5`).
 2. **Tag and Push**: Commit the change, tag it (`git tag v0.1.5`), and push the tag to this remote repository (`git push origin main --tags`).
-3. **Update Homebrew Tap**:
-   - Go to the `Station-DM/homebrew-miniapp` tap repository.
-   - Edit `Formula/miniapp.rb`.
-   - Update the `url` to the new tag's tarball (e.g., `https://github.com/Station-DM/miniapp-cli/archive/refs/tags/v0.1.5.tar.gz`).
-   - Run `curl -sL <the-url-above> | shasum -a 256` to calculate the new hash.
-   - Update the `sha256` field with the new hash.
-   - Commit and push the updated formula.
+3. **Update Homebrew Tap** (choose one):
+   - **自动化**：直接运行 `./update_homebrew_tap.sh`，脚本会自动读取版本号、计算 sha256、更新 Formula 并推送。
+   - **手动**：
+     - Go to the `Station-DM/homebrew-miniapp` tap repository.
+     - Edit `Formula/miniapp.rb`.
+     - Update the `url` to the new tag's tarball (e.g., `https://github.com/Station-DM/miniapp-cli/archive/refs/tags/v0.1.5.tar.gz`).
+     - Run `curl -sL <the-url-above> | shasum -a 256` to calculate the new hash.
+     - Update the `sha256` field with the new hash.
+     - Commit and push the updated formula.
    - Users can now run `brew upgrade miniapp` to get the latest version.
 
 ## Usage
