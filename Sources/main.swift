@@ -416,6 +416,7 @@ func insertShellScriptPhaseBlock(_ content: String, phaseID: String, scriptPathR
     let block = """
             \(phaseID) /* [SDM] Generate Dependencies */ = {
                 isa = PBXShellScriptBuildPhase;
+                alwaysOutOfDate = 1;
                 buildActionMask = 2147483647;
                 files = (
                 );
